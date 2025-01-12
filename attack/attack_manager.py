@@ -81,7 +81,15 @@ class AttackManager(object):
             settings = self.settings
         victim_bp = self.world.get_blueprint_library().find(settings['victim']['blueprint'])
         victim_spawn_point = list_to_transform(settings['victim']['spawn_transform'])
+
+        if not self.world.get_map().get_waypoint(victim_spawn_point.location):
+            print("WARNING: Spawn point might be invalid - not on road/walkable surface")
+
         victim_actor = self.world.spawn_actor(victim_bp, victim_spawn_point)
+
+        if victim_actor is None:
+            print("Failed to spawn victim")
+
         self.victim_walker = victim_actor
         self.actor_list.append(victim_actor)
 
@@ -310,161 +318,81 @@ class AttackManager(object):
         self.cleanup()
         return switched
 
-    def run_attack_3d_surveillance(self, settings=None, higher_view = False, save_imgs_bboxes = False):
-        if settings is None:
-            settings = self.settings
-        else:
-            self.setup_carla(settings)
-        # Spawn the actors
-        if 'surveillance_camera' in settings:
-            self.spawn_surveillance_camera(settings)
-        self.spawn_victim(settings)
-        self.spawn_attacker(settings)
-        spectator_transform = self.camera_actor.get_transform()
-        if higher_view:
-            spectator_transform.location.z = spectator_transform.location.z + 3.
-            spectator_transform.rotation.pitch = -20.
-        self.spectator.set_transform(spectator_transform)
-        attacker = self.attacker_walker
-        #attacker.set_simulate_physics(False)
-        victim = self.victim_walker
 
-        # Store images
-        image_queue = queue.Queue()
-        self.camera_actor.listen(image_queue.put)
+    def draw_collision_debug(self, walker, length=5.0):
+        # Draw debug lines to visualize the collision check
+        start = walker.get_location()
+        direction = walker.get_transform().get_forward_vector()
+        end = carla.Location(
+            x=start.x + direction.x * length,
+            y=start.y + direction.y * length,
+            z=start.z
+        )
 
+        # Draw line in red if blocked, green if clear
+        hit = self.world.cast_ray(start, end)
+        color = carla.Color(255, 0, 0) if hit else carla.Color(0, 255, 0)
 
-        self.world.tick()
+        self.world.debug.draw_line(
+            start,
+            end,
+            thickness=0.1,
+            color=color,
+            life_time=0.5
+        )
 
-        # Save bboxes
-        world_2_camera = np.array(self.camera_actor.get_transform().get_inverse_matrix())
-        bboxes = [[get_2d_bbox(self.victim_walker, self.proj_mat, world_2_camera)], \
-                  [get_2d_bbox(self.attacker_walker, self.proj_mat, world_2_camera)]] # [[victim], [attacker]]
+    def ensure_min_distance(self, target_location, victim_location, min_safe_distance=1.0):
+        """
+        Adjusts target location to maintain minimum safe distance from victim.
         
-        # Store trajectories
-        victim_traj = [transform_to_list(victim.get_transform())]
-        attacker_traj = [transform_to_list(attacker.get_transform())]
-
-        # Movement for the ego vehicle and victim walker
-        victim_control = list_to_walkercontrol(settings['victim']['init_speed'])
-
-        # Record some useful constants
-        victim_delta_location = victim_control.direction * victim_control.speed * settings['world']['fixed_delta_seconds']
-        #map = self.world.get_map()
-
-        # Initialize KF trackers for attack
-        victim_tracker = KalmanBoxTracker(bboxes[0][0])
-        attacker_tracker = KalmanBoxTracker(bboxes[1][0])
-
-        # Create variable for optimization
-        #attacker_states = tf.Variable(convert_bbox_to_z(bboxes[1][0])[:3])
-        switched = False
-
-        # Start the attack
-        for i in range(1, settings['simulation']['max_frame']):
-            victim_traj.append(transform_to_list(victim.get_transform()))
-            attacker_traj.append(transform_to_list(attacker.get_transform()))
-            spectator_transform = self.camera_actor.get_transform()
-            if higher_view:
-                spectator_transform.location.z = spectator_transform.location.z + 3.
-                spectator_transform.rotation.pitch = -20.
-            self.spectator.set_transform(spectator_transform)
-            self.victim_walker.apply_control(victim_control)
-
-            # Victim KF predicted bbox at t
-            victim_pred = victim_tracker.predict_no_trace()[0]
-            # Attacker KF predicted bbox at t
-            attakcer_pred = attacker_tracker.predict_no_trace()[0]
-            # Get current w2c
-            camera_transform = self.camera_actor.get_transform()
-            world_2_camera_curr = tf.constant(camera_transform.get_inverse_matrix(), dtype=tf.float32)
-            # Victim actual bbox at t
-            victim_noise = [np.random.normal(0., 1.), np.random.normal(0., 2.)]
-            victim_curr = get_2d_bbox_with_shift(victim, self.proj_mat, world_2_camera_curr, victim_delta_location)
-            #print(victim_curr)
-            victim_curr = self.add_bbox_noise(victim_curr, victim_noise)
-            #print("perturbed: {}".format(victim_curr))
+        Args:
+            target_location (carla.Location): Proposed location for attacker
+            victim_location (carla.Location): Current victim location
+            min_safe_distance (float): Minimum allowed distance in meters
             
-            # Attacker actual bbox at t
-            attacker_curr = bboxes[1][-1]
-            ious = iou_batch([victim_curr, attacker_curr], [victim_pred, attakcer_pred])
-            # For debug and see results in numerical fashion
-            #print(ious)
-            if ious[0,0] + ious[1,1] < ious[0,1] + ious[1,0] or switched: # ID already switched
-                switched = True
-                attacker.apply_control(WalkerControl(Vector3D(0,0,0), 0))
-
-                self.world.tick()
-
-                world_2_camera = np.array(self.camera_actor.get_transform().get_inverse_matrix())
-                victim_bbox = get_2d_bbox(victim, self.proj_mat, world_2_camera)
-                victim_bbox = self.add_bbox_noise(victim_bbox, victim_noise)
-                attacker_bbox = get_2d_bbox(attacker, self.proj_mat, world_2_camera)
-                bboxes[0].append(victim_bbox)
-                bboxes[1].append(attacker_bbox)
-                victim_tracker.predict()
-                attacker_tracker.predict()
-                victim_tracker.update(attacker_bbox)
-                attacker_tracker.update(victim_bbox)
-            else:
-                # Attacker 3D bbox (8 vertices) at t
-                attacker_3d_bbox = get_verts(attacker)
-                # How far we should move
-                center_displacement = optimize_3d_coord(attacker_tracker, victim_tracker, attacker_3d_bbox, victim_curr, \
-                                                        self.proj_mat, world_2_camera_curr, lr=settings['simulation']['lr'], \
-                                                        iteration=settings['simulation']['iter'], delta_location=self.attacker_movement_limit)
-                #print(center_displacement)
-                direction = carla.Vector3D(center_displacement[0].item(), center_displacement[1].item(), 0.)
-                speed = np.linalg.norm(center_displacement) / self.fixed_delta_seconds
-                if speed > self.attacker_speed_limit:
-                    speed = self.attacker_speed_limit
-                #attacker_control = carla.WalkerControl(direction, speed)
-                target_location = attacker.get_location() + direction
-                target_location.z = attacker.get_location().z
-                attacker.set_transform(carla.Transform(location=target_location, rotation=victim.get_transform().rotation))
-                #attacker.set_location(target_location)
-
-                self.world.tick()
-
-                world_2_camera = np.array(self.camera_actor.get_transform().get_inverse_matrix())
-                victim_bbox = get_2d_bbox(victim, self.proj_mat, world_2_camera)
-                victim_bbox = self.add_bbox_noise(victim_bbox, victim_noise)
-                attacker_bbox = get_2d_bbox(attacker, self.proj_mat, world_2_camera)
-                bboxes[0].append(victim_bbox)
-                bboxes[1].append(attacker_bbox)
-                victim_tracker.predict()
-                attacker_tracker.predict()
-                victim_tracker.update(victim_bbox)
-                attacker_tracker.update(attacker_bbox)
-
-        self.cleanup()
-        # Write image files and bboxes to disk
-        if switched and save_imgs_bboxes==True:
-            current_time = datetime.now()
-            current_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
-            scenario_name = current_time
-            img_dir = os.path.join(settings['output_settings']['img_dir'], scenario_name)
-            if not os.path.exists(img_dir):
-                os.makedirs(img_dir)
-            bbox_dir = settings['output_settings']['bbox_dir']
-            config_dir = settings['output_settings']['config_dir']
-            traj_dir = settings['output_settings']['traj_dir']
-            #config_dir = r'D:\ID-Switch-Sim-Output\surveillance_diff\configs'
-
-            np.save(os.path.join(bbox_dir, '{}.npy'.format(scenario_name)), np.array(bboxes))
-            np.save(os.path.join(traj_dir, '{}.npy'.format(scenario_name)), np.array([victim_traj, attacker_traj]))
-            save_yaml(settings, os.path.join(config_dir, '{}.yaml'.format(scenario_name)))
-            count = 0
-            print("Saving images")
-            while image_queue.empty() != True:
-                img = image_queue.get()
-                #img.save_to_disk(os.path.join(img_dir, '{}.jpg'.format(count)))
-                img = np.reshape(np.copy(img.raw_data), (settings['surveillance_camera']['image_size_y'], settings['surveillance_camera']['image_size_x'], 4))
-                cv2.imwrite(os.path.join(img_dir, '{}.jpg'.format(count)), img)
-                count += 1
-
-        return switched
-
+        Returns:
+            carla.Location: Adjusted location that maintains minimum distance
+        """
+        # Calculate current distance
+        distance_to_victim = np.sqrt(
+            (target_location.x - victim_location.x) ** 2 +
+            (target_location.y - victim_location.y) ** 2
+        )
+        
+        if distance_to_victim < min_safe_distance:
+            # Calculate direction vector from victim to target
+            diff_x = target_location.x - victim_location.x
+            diff_y = target_location.y - victim_location.y
+            
+            # Normalize the direction vector
+            length = np.sqrt(diff_x**2 + diff_y**2)
+            if length > 0:
+                normalized_x = diff_x / length
+                normalized_y = diff_y / length
+                
+                # Set new position at safe distance
+                adjusted_location = carla.Location(
+                    x=victim_location.x + normalized_x * min_safe_distance,
+                    y=victim_location.y + normalized_y * min_safe_distance,
+                    z=target_location.z
+                )
+                return adjusted_location
+                
+        return target_location
+    
+    def draw_bbox(self, image, bbox, color=(0, 255, 0), thickness=2, label=None):
+        """
+        Draw a bounding box on the image.
+        bbox format: [x, y, width, height]
+        color: (B, G, R)
+        """
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        # Draw rectangle
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+        # Add label if provided
+        if label:
+            cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, thickness)
+        return image
 
     def run_attack_3d_surveillance(self, settings=None, higher_view = False, save_imgs_bboxes = False):
         if settings is None:
@@ -490,12 +418,28 @@ class AttackManager(object):
         self.camera_actor.listen(image_queue.put)
 
 
+        # print("Camera location:", self.camera_actor.get_location())
+        # print("Camera rotation:", self.camera_actor.get_transform().rotation)
+        # print("Victim location:", self.victim_walker.get_location())
+        # print("Attacker location:", self.attacker_walker.get_location())
+        # print("Spectator location:", self.spectator.get_transform().location)
+        # print("----------------------------------------------------")
         self.world.tick()
+        # print("Camera location:", self.camera_actor.get_location())
+        # print("Camera rotation:", self.camera_actor.get_transform().rotation)
+        # print("Victim location:", self.victim_walker.get_location())
+        # print("Attacker location:", self.attacker_walker.get_location())
+        # print("Spectator location:", self.spectator.get_transform().location)
+        # raise ValueError("Stop here")
 
         # Save bboxes
         world_2_camera = np.array(self.camera_actor.get_transform().get_inverse_matrix())
-        bboxes = [[get_2d_bbox(self.victim_walker, self.proj_mat, world_2_camera)], \
-                  [get_2d_bbox(self.attacker_walker, self.proj_mat, world_2_camera)]] # [[victim], [attacker]]
+        bboxes = [
+            [get_2d_bbox(self.victim_walker, self.proj_mat, world_2_camera)],
+            [get_2d_bbox(self.attacker_walker, self.proj_mat, world_2_camera)],
+            [get_2d_bbox(self.victim_walker, self.proj_mat, world_2_camera)],
+            [get_2d_bbox(self.attacker_walker, self.proj_mat, world_2_camera)]
+        ] # [[victim], [attacker], [victim_pred], [attacker_pred]]
         
         # Store trajectories
         victim_traj = [transform_to_list(victim.get_transform())]
@@ -524,12 +468,16 @@ class AttackManager(object):
                 spectator_transform.location.z = spectator_transform.location.z + 3.
                 spectator_transform.rotation.pitch = -20.
             self.spectator.set_transform(spectator_transform)
+            # self.draw_collision_debug(victim)
             self.victim_walker.apply_control(victim_control)
 
             # Victim KF predicted bbox at t
             victim_pred = victim_tracker.predict_no_trace()[0]
             # Attacker KF predicted bbox at t
             attakcer_pred = attacker_tracker.predict_no_trace()[0]
+            bboxes[2].append(victim_pred)
+            bboxes[3].append(attakcer_pred)
+
             # Get current w2c
             camera_transform = self.camera_actor.get_transform()
             world_2_camera_curr = tf.constant(camera_transform.get_inverse_matrix(), dtype=tf.float32)
@@ -576,6 +524,10 @@ class AttackManager(object):
                 #attacker_control = carla.WalkerControl(direction, speed)
                 target_location = attacker.get_location() + direction
                 target_location.z = attacker.get_location().z
+
+                # Enforce minimum distance from victim
+                target_location = self.ensure_min_distance(target_location, victim.get_location(), min_safe_distance=1.0)
+
                 attacker.set_transform(carla.Transform(location=target_location, rotation=victim.get_transform().rotation))
                 #attacker.set_location(target_location)
 
@@ -594,13 +546,18 @@ class AttackManager(object):
 
         self.cleanup()
         # Write image files and bboxes to disk
-        if switched and save_imgs_bboxes==True:
+        if save_imgs_bboxes==True:
             current_time = datetime.now()
             current_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
             scenario_name = current_time
             img_dir = os.path.join(settings['output_settings']['img_dir'], scenario_name)
+            if not switched:
+                img_dir = os.path.join(settings['output_settings']['img_dir'], '../img_non_switched', scenario_name)
             if not os.path.exists(img_dir):
                 os.makedirs(img_dir)
+            img_bbx_dir = os.path.join(img_dir, 'with_bbox')
+            if not os.path.exists(img_bbx_dir):
+                os.makedirs(img_bbx_dir)
             bbox_dir = settings['output_settings']['bbox_dir']
             config_dir = settings['output_settings']['config_dir']
             traj_dir = settings['output_settings']['traj_dir']
@@ -613,9 +570,32 @@ class AttackManager(object):
             print("Saving images")
             while image_queue.empty() != True:
                 img = image_queue.get()
-                #img.save_to_disk(os.path.join(img_dir, '{}.jpg'.format(count)))
-                img = np.reshape(np.copy(img.raw_data), (settings['surveillance_camera']['image_size_y'], settings['surveillance_camera']['image_size_x'], 4))
-                cv2.imwrite(os.path.join(img_dir, '{}.jpg'.format(count)), img)
+                # img = np.reshape(np.copy(img.raw_data), (settings['surveillance_camera']['image_size_y'], settings['surveillance_camera']['image_size_x'], 4))
+                # cv2.imwrite(os.path.join(img_dir, '{}.jpg'.format(count)), img)
+
+                img_array = np.reshape(np.copy(img.raw_data), 
+                             (settings['surveillance_camera']['image_size_y'], 
+                              settings['surveillance_camera']['image_size_x'], 4))
+                cv2.imwrite(os.path.join(img_dir, '{}.jpg'.format(count)), img_array)
+                
+                # Convert RGBA to BGR for OpenCV
+                img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
+                # Draw bounding boxes for this frame
+                if count < len(bboxes[0]):  # Make sure we have bboxes for this frame
+                    # Draw victim bbox in green
+                    img_array = self.draw_bbox(img_array, bboxes[0][count], 
+                                            color=(0, 255, 0), label='Victim')
+                    # Draw attacker bbox in red
+                    img_array = self.draw_bbox(img_array, bboxes[1][count], 
+                                            color=(0, 0, 255), label='Attacker')
+                    # Draw predicted victim bbox in blue
+                    img_array = self.draw_bbox(img_array, bboxes[2][count],
+                                            color=(255, 0, 0), label='Predicted Victim')
+                    # Draw predicted attacker bbox in yellow
+                    img_array = self.draw_bbox(img_array, bboxes[3][count],
+                                            color=(0, 100, 255), label='Predicted Attacker')
+                cv2.imwrite(os.path.join(img_dir, 'with_bbox', '{}.jpg'.format(count)), img_array)
+
                 count += 1
 
         return switched
@@ -704,7 +684,7 @@ class AttackManager(object):
             if not os.path.exists(img_dir):
                 os.makedirs(img_dir)
             bbox_dir = settings['output_settings']['bbox_dir']
-            config_dir = 'C:\\Research\\ID-Switch-Sim-Output\\surveillance_baseline\\configs'
+            config_dir = '/home/jiaruili/Documents/exp/advTraj/baselines/parallel_baseline/configs'
 
             np.save(os.path.join(bbox_dir, '{}.npy'.format(scenario_name)), np.array(bboxes))
             save_yaml(settings, os.path.join(config_dir, '{}.yaml'.format(scenario_name)))
