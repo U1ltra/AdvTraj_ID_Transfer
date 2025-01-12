@@ -138,7 +138,12 @@ class KalmanBoxTracker(object):
     Advances the state vector and returns the predicted bounding box estimate.
     """
     if((self.kf.x[6]+self.kf.x[2])<=0):
-      self.kf.x[6].assign(0.0)
+      # self.kf.x[6].assign(0.0)
+      self.kf.x = tf.tensor_scatter_nd_update(
+            self.kf.x,
+            [[6, 0]],  # Update position [6,0] in the 7x1 matrix
+            [tf.constant(0.0, dtype=self.kf.x.dtype)]
+        )
     self.kf.predict()
     self.age += 1
     if(self.time_since_update>0):
