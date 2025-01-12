@@ -36,35 +36,23 @@ def calculate_iou(box1, box2):
     
     return inter_area / union_area if union_area > 0 else 0
 
-class IDSwitchInfo:
-    def __init__(self, frame, old_id, new_id):
-        self.start_frame = frame
-        self.old_id = old_id
-        self.new_id = new_id
-        self.duration = 1
-        self.is_continuing = True
-        self.end_frame = frame
-
-def evaluate_tracking(gt_data, det_data, iou_threshold=0.5):
+def evaluate_cross_switches(gt_data, det_data, iou_threshold=0.5):
     """
-    Evaluate tracking results using Hungarian algorithm for optimal matching
-    gt_data: numpy array of shape (num_objects, num_frames, 4) containing ground truth boxes
+    Evaluate ID switches between two objects, ignoring tracker reassignments
+    gt_data: numpy array of shape (2, num_frames, 4) containing ground truth boxes
     det_data: pandas DataFrame containing detection results
     """
     num_objects, num_frames, _ = gt_data.shape
-    id_switches = 0
-    correct_ids = 0
-    total_matches = 0
+    assert num_objects == 2, "This function is designed for exactly 2 objects"
     
-    # Dictionary to store the first assigned tracking ID for each ground truth object
-    gt_to_track_id = {}  # gt_idx -> first_assigned_track_id
-    
-    # List to store switch information for each GT object
-    switch_history = [[] for _ in range(num_objects)]  # List of IDSwitchInfo objects for each GT object
+    # Dictionary to store the tracking history for each GT object
+    gt_tracking_history = {
+        0: [],  # List of (frame, track_id) for GT object 0
+        1: []   # List of (frame, track_id) for GT object 1
+    }
     
     # Process frame by frame
     for frame in range(num_frames):
-        # Get detections for current frame
         frame_dets = det_data[det_data['frame'] == frame].reset_index(drop=True)
         
         if len(frame_dets) == 0:
@@ -87,63 +75,52 @@ def evaluate_tracking(gt_data, det_data, iou_threshold=0.5):
         
         # Process matches
         for gt_idx, det_idx in zip(gt_indices, det_indices):
-            # Only count if IoU is above threshold
-            if cost_matrix[gt_idx, det_idx] < 0:  # negative cost means valid IoU
-                total_matches += 1
-                det = frame_dets.iloc[det_idx]
-                track_id = det['id']
-                
-                # If this is the first time we see this ground truth object
-                if gt_idx not in gt_to_track_id:
-                    gt_to_track_id[gt_idx] = track_id
-                    correct_ids += 1
-                else:
-                    # Check if the tracking ID is consistent with the first assignment
-                    if gt_to_track_id[gt_idx] == track_id:
-                        correct_ids += 1
-                        # If there was an ongoing switch, mark it as ended
-                        if switch_history[gt_idx] and switch_history[gt_idx][-1].is_continuing:
-                            switch_history[gt_idx][-1].is_continuing = False
-                            switch_history[gt_idx][-1].end_frame = frame - 1
-                    else:
-                        id_switches += 1
-                        # Check if this is a continuation of the previous switch
-                        if (switch_history[gt_idx] and 
-                            switch_history[gt_idx][-1].is_continuing and 
-                            switch_history[gt_idx][-1].new_id == track_id):
-                            # Increment duration of the current switch
-                            switch_history[gt_idx][-1].duration += 1
-                            switch_history[gt_idx][-1].end_frame = frame
-                        else:
-                            # Record new switch
-                            switch_info = IDSwitchInfo(frame, gt_to_track_id[gt_idx], track_id)
-                            switch_history[gt_idx].append(switch_info)
+            if cost_matrix[gt_idx, det_idx] < 0:  # valid match
+                track_id = frame_dets.iloc[det_idx]['id']
+                gt_tracking_history[gt_idx].append((frame, track_id))
     
-    # Calculate persistence metrics
-    persistent_switches = 0
-    avg_switch_duration = 0
-    switch_durations = []
+    # Analyze switches between objects
+    cross_switches = []
+    current_assignment = None  # To store which GT object is matched with which track ID
     
-    for gt_idx in range(num_objects):
-        for switch in switch_history[gt_idx]:
-            if switch.duration > 1:  # Consider a switch persistent if it lasts more than 1 frame
-                persistent_switches += 1
-            switch_durations.append(switch.duration)
+    # Process frames where both objects are detected
+    valid_frames = []
+    for frame in range(num_frames):
+        frame0 = next(((f, tid) for f, tid in gt_tracking_history[0] if f == frame), None)
+        frame1 = next(((f, tid) for f, tid in gt_tracking_history[1] if f == frame), None)
+        
+        if frame0 and frame1:  # Both objects detected
+            valid_frames.append((frame, frame0[1], frame1[1]))
     
-    avg_switch_duration = np.mean(switch_durations) if switch_durations else 0
+    if not valid_frames:
+        return {
+            'cross_switches': [],
+            'num_cross_switches': 0
+        }
     
-    # Calculate metrics
-    id_precision = correct_ids / total_matches if total_matches > 0 else 0
+    # Initialize current assignment from first valid frame
+    first_frame = valid_frames[0]
+    current_assignment = {
+        0: first_frame[1],  # GT object 0's initial track ID
+        1: first_frame[2]   # GT object 1's initial track ID
+    }
+    
+    # Look for switches
+    for frame, id0, id1 in valid_frames[1:]:
+        # Check if IDs have switched relative to current assignment
+        if (id0 == current_assignment[1] and id1 == current_assignment[0]):  # Cross switch detected
+            cross_switches.append({
+                'frame': frame,
+                'before': current_assignment.copy(),
+                'after': {0: id0, 1: id1}
+            })
+            # Update current assignment after switch
+            current_assignment = {0: id0, 1: id1}
     
     return {
-        'id_switches': id_switches,
-        'persistent_switches': persistent_switches,
-        'avg_switch_duration': avg_switch_duration,
-        'correct_ids': correct_ids,
-        'total_matches': total_matches,
-        'id_precision': id_precision,
-        'gt_to_track_id': gt_to_track_id,
-        'switch_history': switch_history
+        'cross_switches': cross_switches,
+        'num_cross_switches': len(cross_switches),
+        'tracking_history': gt_tracking_history
     }
 
 def parse_args():
@@ -158,10 +135,10 @@ def parse_args():
                         help='IoU threshold for matching (default: 0.5)')
     return parser.parse_args()
 
+# Modify main to include this new evaluation
 if __name__ == "__main__":
     args = parse_args()
     
-    # Load data
     try:
         gt_data = np.load(args.gt_path)
         print(f"Loaded ground truth data with shape: {gt_data.shape}")
@@ -176,24 +153,14 @@ if __name__ == "__main__":
         print(f"Error loading detection file: {e}")
         exit(1)
     
-    # Evaluate
-    results = evaluate_tracking(gt_data, det_data, args.iou_threshold)
+    # Evaluate cross switches
+    cross_results = evaluate_cross_switches(gt_data, det_data, args.iou_threshold)
     
-    # Print results
-    print("\nEvaluation Results:")
-    print(f"ID Switches: {results['id_switches']}")
-    print(f"Persistent Switches: {results['persistent_switches']}")
-    print(f"Average Switch Duration: {results['avg_switch_duration']:.2f} frames")
-    print(f"Correct IDs: {results['correct_ids']}")
-    print(f"Total Matches: {results['total_matches']}")
-    print(f"ID Precision: {results['id_precision']:.4f}")
-    
-    # Print detailed switch history
-    print("\nDetailed Switch History:")
-    for gt_idx, switches in enumerate(results['switch_history']):
-        if switches:
-            print(f"\nGT Object {gt_idx}:")
-            for switch in switches:
-                persistence = "Continuing" if switch.is_continuing else f"Ended at frame {switch.end_frame}"
-                print(f"  Frame {switch.start_frame}: {switch.old_id} -> {switch.new_id} "
-                      f"(Duration: {switch.duration} frames, {persistence})")
+    print("\nCross-Object ID Switch Analysis:")
+    print(f"Number of cross switches: {cross_results['num_cross_switches']}")
+    if cross_results['cross_switches']:
+        print("\nDetailed Cross Switches:")
+        for switch in cross_results['num_cross_switches']:
+            print(f"Frame {switch['frame']}:")
+            print(f"  Before - GT0: {switch['before'][0]}, GT1: {switch['before'][1]}")
+            print(f"  After  - GT0: {switch['after'][0]}, GT1: {switch['after'][1]}")
